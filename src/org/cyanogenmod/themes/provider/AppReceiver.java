@@ -20,13 +20,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
-import android.content.res.ThemeManager;
-import android.database.Cursor;
 import android.net.Uri;
-import android.provider.ThemesContract;
 import android.util.Log;
-
-import java.util.Set;
+import org.cyanogenmod.themes.provider.util.ProviderUtils;
 
 public class AppReceiver extends BroadcastReceiver {
     public final static String TAG = AppReceiver.class.getName();
@@ -38,67 +34,36 @@ public class AppReceiver extends BroadcastReceiver {
         final boolean isReplacing = intent.getExtras().getBoolean(Intent.EXTRA_REPLACING, false);
         final String action = intent.getAction();
         try {
+            // All themes/icon packs go to the theme service for processing now so assume
+            // isProcessing is always true when installing/replacing
             if (Intent.ACTION_PACKAGE_ADDED.equals(action) && !isReplacing) {
-                if (!isThemeBeingProcessed(context, pkgName)) {
-                    ThemePackageHelper.insertPackage(context, pkgName);
-                } else {
-                    // store this package name so we know it's being processed and it can be
-                    // added to the DB when ACTION_THEME_RESOURCES_CACHED is received
-                    PreferenceUtils.addThemeBeingProcessed(context, pkgName);
-                }
+                ThemePackageHelper.insertPackage(context, pkgName, true);
             } else if (Intent.ACTION_PACKAGE_FULLY_REMOVED.equals(action)) {
                 ThemePackageHelper.removePackage(context, pkgName);
             } else if (Intent.ACTION_PACKAGE_REPLACED.equals(action)) {
-                if (!isThemeBeingProcessed(context, pkgName)) {
-                    if (themeExistsInProvider(context, pkgName)) {
-                        ThemePackageHelper.updatePackage(context, pkgName);
-                    } else {
-                        // Edge case where app was not a theme in previous install
-                        ThemePackageHelper.insertPackage(context, pkgName);
-                    }
+                if (ProviderUtils.themeExistsInProvider(context, pkgName)) {
+                    ThemePackageHelper.updatePackage(context, pkgName, true);
                 } else {
-                    // store this package name so we know it's being processed and it can be
-                    // added to the DB when ACTION_THEME_RESOURCES_CACHED is received
-                    PreferenceUtils.addThemeBeingProcessed(context, pkgName);
+                    // Edge case where app was not a theme in previous install
+                    ThemePackageHelper.insertPackage(context, pkgName, true);
                 }
             } else if (Intent.ACTION_THEME_RESOURCES_CACHED.equals(action)) {
                 final String themePkgName = intent.getStringExtra(Intent.EXTRA_THEME_PACKAGE_NAME);
                 final int result = intent.getIntExtra(Intent.EXTRA_THEME_RESULT,
                         PackageManager.INSTALL_FAILED_THEME_UNKNOWN_ERROR);
-                Set<String> processingThemes =
-                        PreferenceUtils.getInstalledThemesBeingProcessed(context);
-                if (processingThemes != null &&
-                        processingThemes.contains(themePkgName) && result >= 0) {
-                    if (themeExistsInProvider(context, themePkgName)) {
-                        ThemePackageHelper.updatePackage(context, themePkgName);
+                if (result == 0) {
+                    if (ProviderUtils.themeExistsInProvider(context, themePkgName)) {
+                        ThemePackageHelper.updatePackage(context, themePkgName, false);
                     } else {
                         // Edge case where app was not a theme in previous install
-                        ThemePackageHelper.insertPackage(context, themePkgName);
+                        ThemePackageHelper.insertPackage(context, themePkgName, false);
                     }
+                } else {
+                    Log.e(TAG, "Unable to update theme " + themePkgName + ", result=" + result);
                 }
             }
         } catch(NameNotFoundException e) {
             Log.e(TAG, "Unable to add package to theme's provider ", e);
         }
-    }
-
-    private static boolean themeExistsInProvider(Context context, String pkgName) {
-        boolean exists = false;
-        String[] projection = new String[] { ThemesContract.ThemesColumns.PKG_NAME };
-        String selection = ThemesContract.ThemesColumns.PKG_NAME + "=?";
-        String[] selectionArgs = new String[] { pkgName };
-        Cursor c = context.getContentResolver().query(ThemesContract.ThemesColumns.CONTENT_URI,
-                projection, selection, selectionArgs, null);
-
-        if (c != null) {
-            exists = c.getCount() >= 1;
-            c.close();
-        }
-        return exists;
-    }
-
-    private boolean isThemeBeingProcessed(Context context, String pkgName) {
-        ThemeManager tm = (ThemeManager) context.getSystemService(Context.THEME_SERVICE);
-        return tm.isThemeBeingProcessed(pkgName);
     }
 }

@@ -16,6 +16,7 @@
      limitations under the License.
 -->
 <resources>
-  <string name="app_name">Proveedor de temas</string>
-  <string name="unknown_app_name">Desconocida</string>
+  <string name="app_name">ئۆرنەك تەمىنلىگۈچى</string>
+  <string name="unknown_app_name">يوچۇن</string>
+  <string name="controls_preview_button_text">ئادەتتىكى</string>
 </resources>

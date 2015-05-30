@@ -17,6 +17,7 @@ package org.cyanogenmod.themes.provider;
 
 
 import android.content.ContentProvider;
+import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
@@ -26,6 +27,8 @@ import android.content.UriMatcher;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager.NameNotFoundException;
 import android.content.pm.ThemeUtils;
+import android.content.res.ThemeChangeRequest;
+import android.content.res.ThemeChangeRequest.RequestType;
 import android.content.res.ThemeManager;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
@@ -35,11 +38,15 @@ import android.os.Handler;
 import android.preference.PreferenceManager;
 import android.provider.ThemesContract;
 import android.provider.ThemesContract.MixnMatchColumns;
+import android.provider.ThemesContract.PreviewColumns;
 import android.provider.ThemesContract.ThemesColumns;
+import android.text.TextUtils;
 import android.util.Log;
 
 import org.cyanogenmod.themes.provider.ThemesOpenHelper.MixnMatchTable;
+import org.cyanogenmod.themes.provider.ThemesOpenHelper.PreviewsTable;
 import org.cyanogenmod.themes.provider.ThemesOpenHelper.ThemesTable;
+import org.cyanogenmod.themes.provider.util.ProviderUtils;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -48,7 +55,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 
-import static android.content.res.ThemeConfig.HOLO_DEFAULT;
+import static android.content.res.ThemeConfig.SYSTEM_DEFAULT;
 
 public class ThemesProvider extends ContentProvider {
     private static final String TAG = ThemesProvider.class.getSimpleName();
@@ -57,8 +64,13 @@ public class ThemesProvider extends ContentProvider {
     private static final int MIXNMATCH_KEY = 2;
     private static final int THEMES = 3;
     private static final int THEMES_ID = 4;
+    private static final int PREVIEWS = 5;
+    private static final int PREVIEWS_ID = 6;
+    private static final int APPLIED_PREVIEWS = 7;
 
     private static final UriMatcher sUriMatcher = new UriMatcher(UriMatcher.NO_MATCH);
+
+    public static final String KEY_PROCESS_PREVIEWS = "process_previews";
 
     private final Handler mHandler = new Handler();
     private ThemesOpenHelper mDatabase;
@@ -68,6 +80,9 @@ public class ThemesProvider extends ContentProvider {
         sUriMatcher.addURI(ThemesContract.AUTHORITY, "mixnmatch/*", MIXNMATCH_KEY);
         sUriMatcher.addURI(ThemesContract.AUTHORITY, "themes/", THEMES);
         sUriMatcher.addURI(ThemesContract.AUTHORITY, "themes/#", THEMES_ID);
+        sUriMatcher.addURI(ThemesContract.AUTHORITY, "previews/", PREVIEWS);
+        sUriMatcher.addURI(ThemesContract.AUTHORITY, "previews/#", PREVIEWS_ID);
+        sUriMatcher.addURI(ThemesContract.AUTHORITY, "applied_previews/", APPLIED_PREVIEWS);
     }
 
     public static void setActiveTheme(Context context, String pkgName) {
@@ -90,17 +105,14 @@ public class ThemesProvider extends ContentProvider {
         case THEMES:
             SQLiteDatabase sqlDB = mDatabase.getWritableDatabase();
 
-            // Determine the pkg name and delete preview images
-            String[] columns = new String[] {ThemesColumns.PKG_NAME};
+            // Get the theme's _id and delete preview images
+            String[] columns = new String[] { ThemesColumns._ID };
             Cursor c = sqlDB.query(ThemesTable.TABLE_NAME, columns, selection,
                     selectionArgs, null, null, null);
             if (c == null) return 0;
             if (c.moveToFirst()) {
-                String pkgName = c.getString(0);
-                Intent intent = new Intent(getContext(), CopyImageService.class);
-                intent.setAction(CopyImageService.ACTION_DELETE);
-                intent.putExtra(CopyImageService.EXTRA_PKG_NAME, pkgName);
-                getContext().startService(intent);
+                sqlDB.delete(PreviewsTable.TABLE_NAME,
+                        PreviewColumns.THEME_ID + "=" + c.getInt(0), null);
             }
             c.close();
 
@@ -125,6 +137,10 @@ public class ThemesProvider extends ContentProvider {
             return "vnd.android.cursor.dir/mixnmatch";
         case MIXNMATCH_KEY:
             return "vnd.android.cursor.item/mixnmatch";
+        case PREVIEWS:
+             return "vnd.android.cursor.dir/previews";
+        case PREVIEWS_ID:
+             return "vnd.android.cursor.item/previews";
         default:
             return null;
         }
@@ -137,20 +153,32 @@ public class ThemesProvider extends ContentProvider {
         long id = 0;
         switch (uriType) {
         case THEMES:
+            boolean processPreviews = false;
+            if (values.containsKey(ThemesColumns.INSTALL_STATE)) {
+                int state = values.getAsInteger(ThemesColumns.INSTALL_STATE);
+                processPreviews = state == ThemesColumns.InstallState.INSTALLED;
+            }
             id = sqlDB.insert(ThemesOpenHelper.ThemesTable.TABLE_NAME, null, values);
-            Intent intent = new Intent(getContext(), CopyImageService.class);
-            intent.setAction(CopyImageService.ACTION_INSERT);
-            intent.putExtra(CopyImageService.EXTRA_PKG_NAME,
-                    values.getAsString(ThemesColumns.PKG_NAME));
-            getContext().startService(intent);
+            if (processPreviews) {
+                Intent intent = new Intent(getContext(), PreviewGenerationService.class);
+                intent.setAction(PreviewGenerationService.ACTION_INSERT);
+                intent.putExtra(PreviewGenerationService.EXTRA_PKG_NAME,
+                        values.getAsString(ThemesColumns.PKG_NAME));
+                getContext().startService(intent);
+            }
             break;
         case MIXNMATCH:
             throw new UnsupportedOperationException("Cannot insert rows into MixNMatch table");
+        case PREVIEWS:
+            id = sqlDB.insert(ThemesOpenHelper.PreviewsTable.TABLE_NAME, null, values);
+            break;
         default:
-            throw new IllegalArgumentException("Unknown URI: " + uri);
         }
-        getContext().getContentResolver().notifyChange(uri, null);
-        return Uri.parse(MixnMatchColumns.CONTENT_URI + "/" + id);
+        if (id >= 0) {
+            ContentUris.withAppendedId(uri, id);
+            getContext().getContentResolver().notifyChange(uri, null);
+        }
+        return uri;
     }
 
     @Override
@@ -195,6 +223,15 @@ public class ThemesProvider extends ContentProvider {
             queryBuilder.setTables(THEMES_MIXNMATCH_INNER_JOIN);
             queryBuilder.appendWhere(MixnMatchColumns.COL_KEY + "=" + uri.getLastPathSegment());
             break;
+        case PREVIEWS:
+            queryBuilder.setTables(THEMES_PREVIEWS_INNER_JOIN);
+            break;
+        case PREVIEWS_ID:
+            queryBuilder.setTables(THEMES_PREVIEWS_INNER_JOIN);
+            queryBuilder.appendWhere(PreviewColumns._ID + "=" + uri.getLastPathSegment());
+            break;
+        case APPLIED_PREVIEWS:
+            return getAppliedPreviews(db);
         default:
             return null;
         }
@@ -212,6 +249,10 @@ public class ThemesProvider extends ContentProvider {
             + " INNER JOIN " + ThemesTable.TABLE_NAME + " ON (" + MixnMatchColumns.COL_VALUE
             + " = " + ThemesColumns.PKG_NAME + ")";
 
+    private static final String THEMES_PREVIEWS_INNER_JOIN = PreviewsTable.TABLE_NAME
+            + " INNER JOIN " + ThemesTable.TABLE_NAME + " ON (" + PreviewColumns.THEME_ID
+            + " = " + ThemesTable.TABLE_NAME + "." + ThemesColumns._ID + ")";
+
     @Override
     public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
 
@@ -220,33 +261,116 @@ public class ThemesProvider extends ContentProvider {
 
         switch (sUriMatcher.match(uri)) {
         case THEMES:
-            rowsUpdated = sqlDB.update(ThemesTable.TABLE_NAME, values, selection, selectionArgs);
-            if (updateNotTriggeredByContentProvider(values)) {
-                Intent intent = new Intent(getContext(), CopyImageService.class);
-                intent.putExtra(CopyImageService.EXTRA_PKG_NAME,
-                        values.getAsString(ThemesColumns.PKG_NAME));
-                getContext().startService(intent);
-                getContext().getContentResolver().notifyChange(uri, null);
-            }
-            return rowsUpdated;
         case THEMES_ID:
+            String pkgName = values.getAsString(ThemesColumns.PKG_NAME);
+            boolean updatePreviews = false;
+            if (values.containsKey(ThemesColumns.INSTALL_STATE)) {
+                int state = values.getAsInteger(ThemesColumns.INSTALL_STATE);
+                updatePreviews = state == ThemesColumns.InstallState.INSTALLED;
+            }
             rowsUpdated = sqlDB.update(ThemesTable.TABLE_NAME, values, selection, selectionArgs);
-            if (updateNotTriggeredByContentProvider(values)) {
-                Intent intent = new Intent(getContext(), CopyImageService.class);
-                intent.putExtra(CopyImageService.EXTRA_PKG_NAME,
-                        values.getAsString(ThemesColumns.PKG_NAME));
+            if (updateNotTriggeredByContentProvider(values) && updatePreviews) {
+                Intent intent = new Intent(getContext(), PreviewGenerationService.class);
+                intent.setAction(PreviewGenerationService.ACTION_UPDATE);
+                intent.putExtra(PreviewGenerationService.EXTRA_PKG_NAME, pkgName);
                 getContext().startService(intent);
-                getContext().getContentResolver().notifyChange(uri, null);
             }
             getContext().getContentResolver().notifyChange(uri, null);
-            return rowsUpdated;
+            break;
         case MIXNMATCH:
+            // Make the current value the previous value
+            String prevValue = ProviderUtils.getCurrentThemeForComponent(getContext(),
+                    selection, selectionArgs);
+            String newValue = values.getAsString(MixnMatchColumns.COL_VALUE);
+            if (prevValue != null &&
+                    prevValue.equals(newValue)) {
+                // Component re-applied?  Most likely so remove the update time
+                values.remove(MixnMatchColumns.COL_UPDATE_TIME);
+            } else if (prevValue != null) {
+                values.put(MixnMatchColumns.COL_PREV_VALUE, prevValue);
+            }
             rowsUpdated = sqlDB.update(MixnMatchTable.TABLE_NAME, values, selection, selectionArgs);
             getContext().getContentResolver().notifyChange(uri, null);
+            break;
         case MIXNMATCH_KEY:
             // Don't support right now. Any need?
+            break;
+        case PREVIEWS:
+            rowsUpdated = sqlDB.update(PreviewsTable.TABLE_NAME, values, selection, selectionArgs);
+            getContext().getContentResolver().notifyChange(uri, null);
+            break;
         }
         return rowsUpdated;
+    }
+
+    /**
+     * Queries the currently applied components and creates a SQLite statement consisting
+     * of a series of (SELECT ...) statements
+     * @param db Readable database
+     * @return
+     */
+    private Cursor getAppliedPreviews(SQLiteDatabase db) {
+        Cursor c = db.query(MixnMatchTable.TABLE_NAME, null, null, null, null, null, null);
+        if (c != null) {
+            StringBuilder sb = new StringBuilder("SELECT * FROM ");
+            String delimeter = "";
+            while (c.moveToNext()) {
+                String key = c.getString(0);
+                String pkgName = c.getString(1);
+                String component = key != null ? MixnMatchColumns.mixNMatchKeyToComponent(key) :
+                        null;
+                if (component != null && pkgName != null) {
+                    // We need to get the theme's id using its package name
+                    String[] columns = { ThemesColumns._ID };
+                    Cursor current = db.query(ThemesTable.TABLE_NAME, columns,
+                            ThemesColumns.PKG_NAME + "='" + pkgName + "'", null, null, null, null);
+                    int id = -1;
+                    if (current != null) {
+                        if (current.moveToFirst()) id = current.getInt(0);
+                        current.close();
+                    }
+                    if (id >= 0) {
+                        if (ThemesColumns.MODIFIES_STATUS_BAR.equals(component)) {
+                            sb.append(delimeter).append("(SELECT ");
+                            sb.append(TextUtils.join(",",
+                                    PreviewsTable.STATUS_BAR_PREVIEW_COLUMNS));
+                            sb.append(String.format(" FROM previews WHERE %s=%d)",
+                                    PreviewColumns.THEME_ID, id));
+                            delimeter = ",";
+                        } else if (ThemesColumns.MODIFIES_ICONS.equals(component)) {
+                            sb.append(delimeter).append("(SELECT ");
+                            sb.append(TextUtils.join(",", PreviewsTable.ICON_PREVIEW_COLUMNS));
+                            sb.append(String.format(" FROM previews WHERE %s=%d)",
+                                    PreviewColumns.THEME_ID, id));
+                            delimeter = ",";
+                        } else if (ThemesColumns.MODIFIES_LAUNCHER.equals(component)) {
+                            sb.append(delimeter).append("(SELECT ");
+                            sb.append(String.format("%s", PreviewColumns.WALLPAPER_PREVIEW));
+                            sb.append(String.format(" FROM previews WHERE %s=%d)",
+                                    PreviewColumns.THEME_ID, id));
+                            delimeter = ",";
+                        } else if (ThemesColumns.MODIFIES_NAVIGATION_BAR.equals(component)) {
+                            sb.append(delimeter).append("(SELECT ");
+                            sb.append(TextUtils.join(",",
+                                    PreviewsTable.NAVIGATION_BAR_PREVIEW_COLUMNS));
+                            sb.append(String.format(" FROM previews WHERE %s=%d)",
+                                    PreviewColumns.THEME_ID, id));
+                            delimeter = ",";
+                        } else if (ThemesColumns.MODIFIES_OVERLAYS.equals(component)) {
+                            sb.append(delimeter).append("(SELECT ");
+                            sb.append(PreviewColumns.STYLE_PREVIEW);
+                            sb.append(String.format(" FROM previews WHERE %s=%d)",
+                                    PreviewColumns.THEME_ID, id));
+                            delimeter = ",";
+                        }
+                    }
+                }
+            }
+            c.close();
+            sb.append(";");
+            return db.rawQuery(sb.toString(), null);
+        }
+        return null;
     }
 
     /**
@@ -259,6 +383,31 @@ public class ThemesProvider extends ContentProvider {
         return !(values.containsKey(ThemesColumns.HOMESCREEN_URI)
                 || values.containsKey(ThemesColumns.LOCKSCREEN_URI) || values
                     .containsKey(ThemesColumns.STYLE_URI));
+    }
+
+    private boolean getShouldUpdatePreviews(SQLiteDatabase db, String pkgName) {
+        if (pkgName != null) {
+            long lastUpdateTime = 0;
+            String[] columns = {ThemesColumns.LAST_UPDATE_TIME};
+            String selection = ThemesColumns.PKG_NAME + "=?";
+            String[] selectionArgs = {pkgName};
+            Cursor c =
+                    db.query(ThemesTable.TABLE_NAME, columns, selection, selectionArgs, null, null,
+                            null);
+            if (c != null) {
+                c.moveToFirst();
+                lastUpdateTime = c.getInt(0);
+                c.close();
+            }
+
+            try {
+                PackageInfo pi = getContext().getPackageManager().getPackageInfo(pkgName, 0);
+                return lastUpdateTime < pi.lastUpdateTime;
+            } catch (NameNotFoundException e) {
+                Log.w(TAG, "Unable to retrieve PackageInfo for " + pkgName, e);
+            }
+        }
+        return false;
     }
 
     /**
@@ -303,7 +452,7 @@ public class ThemesProvider extends ContentProvider {
             List<PackageInfo> themePackages = new ArrayList<PackageInfo>();
             Map<String, PackageInfo> pmThemes = new HashMap<String, PackageInfo>();
             for (PackageInfo info : packages) {
-                if (info.isThemeApk || info.isLegacyThemeApk || info.isLegacyIconPackApk) {
+                if (info.isThemeApk || info.isLegacyIconPackApk) {
                     themePackages.add(info);
                     pmThemes.put(info.packageName, info);
                 }
@@ -326,10 +475,10 @@ public class ThemesProvider extends ContentProvider {
                 String pkgName = current.getString(pkgNameIdx);
                 boolean isDefault = current.getInt(isDefaultIdx) == 1;
 
-                // Ignore holo theme
-                if (pkgName.equals(HOLO_DEFAULT)) {
-                    if (defaultThemePkg.equals(HOLO_DEFAULT) != isDefault) {
-                        updateList.add(HOLO_DEFAULT);
+                // Ignore system theme
+                if (pkgName.equals(SYSTEM_DEFAULT)) {
+                    if (defaultThemePkg.equals(SYSTEM_DEFAULT) != isDefault) {
+                        updateList.add(SYSTEM_DEFAULT);
                     }
                     continue;
                 }
@@ -354,10 +503,11 @@ public class ThemesProvider extends ContentProvider {
                 // will be the ones to insert into the provider
                 pmThemes.remove(pkgName);
             }
+            current.close();
 
             // Check currently applied components (fonts, wallpapers etc) and verify the theme is
             // still installed. If it is not installed, set the component back to the default theme
-            List<String> moveToDefault = new LinkedList<String>();
+            ThemeChangeRequest.Builder builder = new ThemeChangeRequest.Builder();
             Cursor mixnmatch = mDb.query(MixnMatchTable.TABLE_NAME, null, null, null, null, null,
                     null);
             while (mixnmatch.moveToNext()) {
@@ -369,12 +519,18 @@ public class ThemesProvider extends ContentProvider {
                 String pkg = mixnmatch.getString(mixnmatch
                         .getColumnIndex(MixnMatchColumns.COL_VALUE));
                 if (deleteList.contains(pkg)) {
-                    moveToDefault.add(component);
+                    builder.setComponent(component, SYSTEM_DEFAULT);
                 }
             }
-            ThemeManager mService = (ThemeManager) getContext().getSystemService(
-                    Context.THEME_SERVICE);
-            mService.requestThemeChange(HOLO_DEFAULT, moveToDefault);
+            mixnmatch.close();
+
+            builder.setRequestType(RequestType.THEME_REMOVED);
+            ThemeChangeRequest request = builder.build();
+            if (request.getNumChangesRequested() > 0) {
+                ThemeManager mService = (ThemeManager) getContext().getSystemService(
+                        Context.THEME_SERVICE);
+                mService.requestThemeChange(request, false);
+            }
 
             // Update the database after we revert to default
             deleteThemes(deleteList);
@@ -395,7 +551,9 @@ public class ThemesProvider extends ContentProvider {
         private void insertThemes(Collection<PackageInfo> themesToInsert) {
             for (PackageInfo themeInfo : themesToInsert) {
                 try {
-                    ThemePackageHelper.insertPackage(getContext(), themeInfo.packageName);
+                    final Context context = getContext();
+                    ThemePackageHelper.insertPackage(context, themeInfo.packageName,
+                            ProviderUtils.isThemeBeingProcessed(context, themeInfo.packageName));
                 } catch (NameNotFoundException e) {
                     Log.e(TAG, "Unable to insert theme " + themeInfo.packageName, e);
                 }
@@ -405,12 +563,13 @@ public class ThemesProvider extends ContentProvider {
         private void updateThemes(List<String> themesToUpdate) {
             for (String pkgName : themesToUpdate) {
                 try {
-                    ThemePackageHelper.updatePackage(getContext(), pkgName);
+                    final Context context = getContext();
+                    ThemePackageHelper.updatePackage(context, pkgName,
+                            ProviderUtils.isThemeBeingProcessed(context, pkgName));
                 } catch (NameNotFoundException e) {
                     Log.e(TAG, "Unable to update theme " + pkgName, e);
                 }
             }
         }
     }
-
 }

@@ -15,9 +15,9 @@
  */
 package org.cyanogenmod.themes.provider;
 
+import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
-import android.content.pm.LegacyThemeInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
@@ -25,23 +25,26 @@ import android.content.pm.ThemeInfo;
 import android.content.pm.ThemeUtils;
 import android.content.res.AssetManager;
 import android.content.res.Configuration;
+import android.content.res.ThemeChangeRequest;
+import android.content.res.ThemeChangeRequest.RequestType;
 import android.content.res.ThemeConfig;
 import android.content.res.ThemeManager;
 import android.database.Cursor;
 import android.provider.ThemesContract;
 import android.provider.ThemesContract.MixnMatchColumns;
 import android.provider.ThemesContract.ThemesColumns;
-import android.text.TextUtils;
+import android.provider.ThemesContract.ThemesColumns.InstallState;
 import android.util.Log;
+import org.cyanogenmod.themes.provider.util.ProviderUtils;
 
 import java.io.IOException;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.List;
 import java.util.Map;
 
-import static android.content.res.ThemeConfig.HOLO_DEFAULT;
+import static android.content.res.ThemeConfig.SYSTEMUI_NAVBAR_PKG;
+import static android.content.res.ThemeConfig.SYSTEMUI_STATUS_BAR_PKG;
+import static android.content.res.ThemeConfig.SYSTEM_DEFAULT;
 
 /**
  * Helper class to populate the provider with info from the theme.
@@ -61,32 +64,34 @@ public class ThemePackageHelper {
         sComponentToFolderName.put(ThemesColumns.MODIFIES_ALARMS, "alarms");
         sComponentToFolderName.put(ThemesColumns.MODIFIES_NOTIFICATIONS, "notifications");
         sComponentToFolderName.put(ThemesColumns.MODIFIES_RINGTONES, "ringtones");
+        sComponentToFolderName.put(ThemesColumns.MODIFIES_STATUS_BAR,
+                "overlays/com.android.systemui");
+        sComponentToFolderName.put(ThemesColumns.MODIFIES_NAVIGATION_BAR,
+                "overlays/com.android.systemui");
     }
 
-    public static boolean insertPackage(Context context, String pkgName)
+    public static boolean insertPackage(Context context, String pkgName, boolean isProcessing)
             throws NameNotFoundException {
         PackageInfo pi = context.getPackageManager().getPackageInfo(pkgName, 0);
         if (pi == null)
             return false;
 
         Map<String, Boolean> capabilities = getCapabilities(context, pkgName);
-        if (pi.themeInfos != null && pi.themeInfos.length > 0) {
-            insertPackageInternal(context, pi, capabilities);
-        } else if (pi.legacyThemeInfos != null && pi.legacyThemeInfos.length > 0) {
-            insertLegacyPackageInternal(context, pi, capabilities);
+        if (pi.themeInfo != null) {
+            insertPackageInternal(context, pi, capabilities, isProcessing);
         } else if (pi.isLegacyIconPackApk){
             // We must be here because it is a legacy icon pack
             capabilities = new HashMap<String, Boolean>();
             capabilities.put(ThemesColumns.MODIFIES_ICONS, true);
-            insertLegacyIconPackInternal(context, pi, capabilities);
+            insertLegacyIconPackInternal(context, pi, capabilities, isProcessing);
         }
         return true;
     }
 
     private static void insertPackageInternal(Context context, PackageInfo pi,
-            Map<String, Boolean> capabilities) {
-        ThemeInfo info = pi.themeInfos[0];
-        boolean isPresentableTheme = ThemePackageHelper.isPresentableTheme(capabilities);
+            Map<String, Boolean> capabilities, boolean isProcessing) {
+        ThemeInfo info = pi.themeInfo;
+        boolean isPresentableTheme = isPresentableTheme(capabilities);
 
         ContentValues values = new ContentValues();
         values.put(ThemesColumns.PKG_NAME, pi.packageName);
@@ -94,30 +99,14 @@ public class ThemePackageHelper {
         values.put(ThemesColumns.AUTHOR, info.author);
         values.put(ThemesColumns.DATE_CREATED, System.currentTimeMillis());
         values.put(ThemesColumns.PRESENT_AS_THEME, isPresentableTheme);
-        values.put(ThemesColumns.IS_LEGACY_THEME, pi.isLegacyThemeApk);
+        values.put(ThemesColumns.IS_LEGACY_THEME, false);
         values.put(ThemesColumns.IS_DEFAULT_THEME,
                 ThemeUtils.getDefaultThemePackageName(context).equals(pi.packageName) ? 1 : 0);
         values.put(ThemesColumns.LAST_UPDATE_TIME, pi.lastUpdateTime);
-
-        // Insert theme capabilities
-        insertCapabilities(capabilities, values);
-
-        context.getContentResolver().insert(ThemesColumns.CONTENT_URI, values);
-    }
-
-    private static void insertLegacyPackageInternal(Context context, PackageInfo pi,
-            Map<String, Boolean> capabilities) {
-        LegacyThemeInfo info = pi.legacyThemeInfos[0];
-        ContentValues values = new ContentValues();
-        values.put(ThemesColumns.PKG_NAME, pi.packageName);
-        values.put(ThemesColumns.TITLE, info.name);
-        values.put(ThemesColumns.AUTHOR, info.author);
-        values.put(ThemesColumns.DATE_CREATED, System.currentTimeMillis());
-        values.put(ThemesColumns.PRESENT_AS_THEME, 1);
-        values.put(ThemesColumns.IS_LEGACY_THEME, pi.isLegacyThemeApk);
-        values.put(ThemesColumns.IS_DEFAULT_THEME,
-                ThemeUtils.getDefaultThemePackageName(context).equals(pi.packageName) ? 1 : 0);
-        values.put(ThemesColumns.LAST_UPDATE_TIME, pi.lastUpdateTime);
+        values.put(ThemesColumns.INSTALL_TIME, pi.firstInstallTime);
+        values.put(ThemesColumns.TARGET_API, pi.applicationInfo.targetSdkVersion);
+        values.put(ThemesColumns.INSTALL_STATE, isProcessing ? InstallState.INSTALLING :
+                InstallState.INSTALLED);
 
         // Insert theme capabilities
         insertCapabilities(capabilities, values);
@@ -126,7 +115,7 @@ public class ThemePackageHelper {
     }
 
     private static void insertLegacyIconPackInternal(Context context, PackageInfo pi,
-                                                    Map<String, Boolean> capabilities) {
+            Map<String, Boolean> capabilities, boolean isProcessing) {
         PackageManager pm = context.getPackageManager();
         CharSequence labelName = pm.getApplicationLabel(pi.applicationInfo);
         if (labelName == null) labelName = context.getString(R.string.unknown_app_name);
@@ -137,7 +126,11 @@ public class ThemePackageHelper {
         values.put(ThemesColumns.AUTHOR, "");
         values.put(ThemesColumns.DATE_CREATED, System.currentTimeMillis());
         values.put(ThemesColumns.LAST_UPDATE_TIME, pi.lastUpdateTime);
+        values.put(ThemesColumns.INSTALL_TIME, pi.firstInstallTime);
         values.put(ThemesColumns.IS_LEGACY_ICONPACK, 1);
+        values.put(ThemesColumns.TARGET_API, pi.applicationInfo.targetSdkVersion);
+        values.put(ThemesColumns.INSTALL_STATE, isProcessing ? InstallState.INSTALLING :
+                InstallState.INSTALLED);
 
         // Insert theme capabilities
         insertCapabilities(capabilities, values);
@@ -145,67 +138,42 @@ public class ThemePackageHelper {
         context.getContentResolver().insert(ThemesColumns.CONTENT_URI, values);
     }
 
-    public static void updatePackage(Context context, String pkgName) throws NameNotFoundException {
-        if (HOLO_DEFAULT.equals(pkgName)) {
-            updateHoloPackageInternal(context);
+    public static void updatePackage(Context context, String pkgName, boolean isProcessing)
+            throws NameNotFoundException {
+        if (SYSTEM_DEFAULT.equals(pkgName)) {
+            updateSystemPackageInternal(context);
         } else {
             PackageInfo pi = context.getPackageManager().getPackageInfo(pkgName, 0);
             Map<String, Boolean> capabilities = getCapabilities(context, pkgName);
-            if (pi.themeInfos != null && pi.themeInfos.length > 0) {
-                updatePackageInternal(context, pi, capabilities);
-            } else if (pi.legacyThemeInfos != null && pi.legacyThemeInfos.length > 0) {
-                updateLegacyPackageInternal(context, pi, capabilities);
+            if (pi.themeInfo != null) {
+                updatePackageInternal(context, pi, capabilities, isProcessing);
             } else if (pi.isLegacyIconPackApk) {
-                updateLegacyIconPackInternal(context, pi, capabilities);
+                updateLegacyIconPackInternal(context, pi, capabilities, isProcessing);
             }
-
-            // We should reapply any components that are currently applied for this theme.
-            reapplyInstalledComponentsForTheme(context, pkgName);
         }
     }
 
     private static void updatePackageInternal(Context context, PackageInfo pi,
-            Map<String, Boolean> capabilities) {
-        ThemeInfo info = pi.themeInfos[0];
+            Map<String, Boolean> capabilities, boolean isProcessing) {
+        ThemeInfo info = pi.themeInfo;
         boolean isPresentableTheme = ThemePackageHelper.isPresentableTheme(capabilities);
+        final int oldInstallState =
+                ProviderUtils.getInstallStateForTheme(context, pi.packageName);
+        final int newState = isProcessing ? InstallState.UPDATING : InstallState.INSTALLED;
+
         ContentValues values = new ContentValues();
         values.put(ThemesColumns.PKG_NAME, pi.packageName);
         values.put(ThemesColumns.TITLE, info.name);
         values.put(ThemesColumns.AUTHOR, info.author);
         values.put(ThemesColumns.DATE_CREATED, System.currentTimeMillis());
         values.put(ThemesColumns.PRESENT_AS_THEME, isPresentableTheme);
-        values.put(ThemesColumns.IS_LEGACY_THEME, pi.isLegacyThemeApk);
+        values.put(ThemesColumns.IS_LEGACY_THEME, false);
         values.put(ThemesColumns.IS_DEFAULT_THEME,
                 ThemeUtils.getDefaultThemePackageName(context).equals(pi.packageName) ? 1 : 0);
         values.put(ThemesColumns.LAST_UPDATE_TIME, pi.lastUpdateTime);
-
-        String where = ThemesColumns.PKG_NAME + "=?";
-        String[] args = { pi.packageName };
-        context.getContentResolver().update(ThemesColumns.CONTENT_URI, values, where, args);
-    }
-
-    private static void updateHoloPackageInternal(Context context) {
-        ContentValues values = new ContentValues();
-        values.put(ThemesColumns.IS_DEFAULT_THEME,
-                HOLO_DEFAULT == ThemeUtils.getDefaultThemePackageName(context) ? 1 : 0);
-        String where = ThemesColumns.PKG_NAME + "=?";
-        String[] args = { HOLO_DEFAULT };
-        context.getContentResolver().update(ThemesColumns.CONTENT_URI, values, where, args);
-    }
-
-    private static void updateLegacyPackageInternal(Context context, PackageInfo pi,
-            Map<String, Boolean> capabilities) {
-        LegacyThemeInfo info = pi.legacyThemeInfos[0];
-        ContentValues values = new ContentValues();
-        values.put(ThemesColumns.PKG_NAME, pi.packageName);
-        values.put(ThemesColumns.TITLE, info.name);
-        values.put(ThemesColumns.AUTHOR, info.author);
-        values.put(ThemesColumns.DATE_CREATED, System.currentTimeMillis());
-        values.put(ThemesColumns.PRESENT_AS_THEME, 1);
-        values.put(ThemesColumns.IS_LEGACY_THEME, pi.isLegacyThemeApk);
-        values.put(ThemesColumns.IS_DEFAULT_THEME,
-                ThemeUtils.getDefaultThemePackageName(context).equals(pi.packageName) ? 1 : 0);
-        values.put(ThemesColumns.LAST_UPDATE_TIME, pi.lastUpdateTime);
+        values.put(ThemesColumns.INSTALL_TIME, pi.firstInstallTime);
+        values.put(ThemesColumns.TARGET_API, pi.applicationInfo.targetSdkVersion);
+        values.put(ThemesColumns.INSTALL_STATE, newState);
 
         // Insert theme capabilities
         insertCapabilities(capabilities, values);
@@ -213,30 +181,61 @@ public class ThemePackageHelper {
         String where = ThemesColumns.PKG_NAME + "=?";
         String[] args = { pi.packageName };
         context.getContentResolver().update(ThemesColumns.CONTENT_URI, values, where, args);
+
+        // Broadcast that the theme is installed if the previous state was INSTALLING and
+        // the new state is INSTALLED.
+        if (newState == ThemesColumns.InstallState.INSTALLED) {
+            if (oldInstallState == ThemesColumns.InstallState.INSTALLING) {
+                ProviderUtils.sendThemeInstalledBroadcast(context, pi.packageName);
+            } else if (oldInstallState == ThemesColumns.InstallState.UPDATING) {
+                ProviderUtils.sendThemeUpdatedBroadcast(context, pi.packageName);
+                // We should reapply any components that are currently applied for this theme.
+                reapplyInstalledComponentsForTheme(context, pi.packageName);
+            }
+        }
+    }
+
+    private static void updateSystemPackageInternal(Context context) {
+        ContentValues values = new ContentValues();
+        values.put(ThemesColumns.IS_DEFAULT_THEME,
+                SYSTEM_DEFAULT == ThemeUtils.getDefaultThemePackageName(context) ? 1 : 0);
+        String where = ThemesColumns.PKG_NAME + "=?";
+        String[] args = { SYSTEM_DEFAULT };
+        context.getContentResolver().update(ThemesColumns.CONTENT_URI, values, where, args);
     }
 
     private static void updateLegacyIconPackInternal(Context context, PackageInfo pi,
-                                              Map<String, Boolean> capabilities) {
+            Map<String, Boolean> capabilities, boolean isProcessing) {
         PackageManager pm = context.getPackageManager();
         CharSequence labelName = pm.getApplicationLabel(pi.applicationInfo);
         if (labelName == null) labelName = context.getString(R.string.unknown_app_name);
 
-        boolean isPresentableTheme = ThemePackageHelper.isPresentableTheme(capabilities);
         ContentValues values = new ContentValues();
         values.put(ThemesColumns.PKG_NAME, pi.packageName);
         values.put(ThemesColumns.TITLE, labelName.toString());
         values.put(ThemesColumns.DATE_CREATED, System.currentTimeMillis());
         values.put(ThemesColumns.LAST_UPDATE_TIME, pi.lastUpdateTime);
+        values.put(ThemesColumns.INSTALL_TIME, pi.firstInstallTime);
+        values.put(ThemesColumns.TARGET_API, pi.applicationInfo.targetSdkVersion);
+        values.put(ThemesColumns.INSTALL_STATE,
+                isProcessing ? InstallState.UPDATING : InstallState.INSTALLED);
 
         String where = ThemesColumns.PKG_NAME + "=?";
         String[] args = { pi.packageName };
         context.getContentResolver().update(ThemesColumns.CONTENT_URI, values, where, args);
+
+        if (!isProcessing) {
+            // We should reapply any components that are currently applied for this theme.
+            reapplyInstalledComponentsForTheme(context, pi.packageName);
+        }
     }
 
     public static void removePackage(Context context, String pkgToRemove) {
         // Check currently applied components (fonts, wallpapers etc) and verify the theme is still
         // installed. If it is not installed, we need to set the component back to the default theme
-        List<String> moveToDefault = new LinkedList<String>(); // components to move back to default
+        ThemeChangeRequest.Builder builder = new ThemeChangeRequest.Builder();
+        Map<String, String> defaultComponents = ThemeUtils.getDefaultComponents(context);
+
         Cursor mixnmatch = context.getContentResolver().query(MixnMatchColumns.CONTENT_URI, null,
                 null, null, null);
         while (mixnmatch.moveToNext()) {
@@ -246,17 +245,37 @@ public class ThemePackageHelper {
                     .mixNMatchKeyToComponent(mixnmatchKey);
             String pkg = mixnmatch.getString(mixnmatch.getColumnIndex(MixnMatchColumns.COL_VALUE));
             if (pkgToRemove.equals(pkg)) {
-                moveToDefault.add(component);
+                builder.setComponent(component, defaultComponents.get(component));
             }
         }
-        String pkgName = ThemeUtils.getDefaultThemePackageName(context);
+
+        // Check for any per-app themes components using this theme
+        final Configuration config = context.getResources().getConfiguration();
+        final ThemeConfig themeConfig = config != null ? config.themeConfig : null;
+        if (themeConfig != null) {
+            final Map<String, ThemeConfig.AppTheme> themes = themeConfig.getAppThemes();
+            final String defaultOverlayPkgName
+                    = defaultComponents.get(ThemesColumns.MODIFIES_OVERLAYS);
+            for (String appPkgName : themes.keySet()) {
+                if (ThemeUtils.isPerAppThemeComponent(appPkgName) &&
+                        pkgToRemove.equals(themes.get(appPkgName).getOverlayPkgName())) {
+                    builder.setAppOverlay(appPkgName, defaultOverlayPkgName);
+                }
+            }
+        }
+        mixnmatch.close();
+
+        builder.setRequestType(RequestType.THEME_REMOVED);
         ThemeManager manager = (ThemeManager) context.getSystemService(Context.THEME_SERVICE);
-        manager.requestThemeChange(pkgName, moveToDefault);
+        manager.requestThemeChange(builder.build(), false);
 
         // Delete the theme from the db
         String selection = ThemesColumns.PKG_NAME + "= ?";
         String[] selectionArgs = { pkgToRemove };
-        context.getContentResolver().delete(ThemesColumns.CONTENT_URI, selection, selectionArgs);
+        final ContentResolver resolver = context.getContentResolver();
+        if (resolver.delete(ThemesColumns.CONTENT_URI, selection, selectionArgs) > 0) {
+            ProviderUtils.sendThemeRemovedBroadcast(context, pkgToRemove);
+        }
     }
 
     /**
@@ -288,8 +307,7 @@ public class ThemePackageHelper {
         for (Map.Entry<String, String> entry : sComponentToFolderName.entrySet()) {
             String component = entry.getKey();
             String folderName = entry.getValue();
-            boolean hasComponent = pi.isLegacyThemeApk ? hasThemeComponentLegacy(pi, component)
-                    : hasThemeComponent(themeContext, folderName);
+            boolean hasComponent = hasThemeComponent(themeContext, folderName);
             implementMap.put(component, hasComponent);
         }
         return implementMap;
@@ -304,29 +322,7 @@ public class ThemePackageHelper {
         }
     }
 
-    private static boolean hasThemeComponentLegacy(PackageInfo pi, String component) {
-        if (ThemesColumns.MODIFIES_OVERLAYS.equals(component)) {
-            return true;
-        } else if (ThemesColumns.MODIFIES_LAUNCHER.equals(component)) {
-            if (pi.legacyThemeInfos != null && pi.legacyThemeInfos.length > 0
-                    && pi.legacyThemeInfos[0].wallpaperResourceId != 0) {
-                return true;
-            }
-        } else if (ThemesColumns.MODIFIES_RINGTONES.equals(component)) {
-            if (pi.legacyThemeInfos != null && pi.legacyThemeInfos.length > 0
-                    && !TextUtils.isEmpty(pi.legacyThemeInfos[0].ringtoneFileName)) {
-                return true;
-            }
-        } else if (ThemesColumns.MODIFIES_NOTIFICATIONS.equals(component)) {
-            if (pi.legacyThemeInfos != null && pi.legacyThemeInfos.length > 0
-                    && !TextUtils.isEmpty(pi.legacyThemeInfos[0].notificationFileName)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean hasThemeComponent(Context themeContext, String component) {
+    public static boolean hasThemeComponent(Context themeContext, String component) {
         boolean found = false;
         AssetManager assetManager = themeContext.getAssets();
         try {
@@ -341,36 +337,52 @@ public class ThemePackageHelper {
     }
 
     // Presently we are defining a "presentable" theme as any theme
-    // which implements 2+ components. Such themes can be shown to the user
-    // under the "themes" category.
+    // which has icons, wallpaper, and overlays
     public static boolean isPresentableTheme(Map<String, Boolean> implementMap) {
-        int count = 0;
-        for (Boolean isImplemented : implementMap.values()) {
-            count += isImplemented ? 1 : 0;
-        }
-        return count >= 2;
+        return implementMap != null &&
+                hasThemeComponent(implementMap, ThemesColumns.MODIFIES_LAUNCHER) &&
+                hasThemeComponent(implementMap, ThemesColumns.MODIFIES_OVERLAYS);
+    }
+
+    private static boolean hasThemeComponent(Map<String, Boolean> componentMap, String component) {
+        return componentMap.containsKey(component) && componentMap.get(component);
     }
 
     private static void reapplyInstalledComponentsForTheme(Context context, String pkgName) {
         Configuration config = context.getResources().getConfiguration();
         if (config == null || config.themeConfig == null) return;
 
-        List<String> reApply = new LinkedList<String>(); // components to re-apply
+        ThemeChangeRequest.Builder builder = new ThemeChangeRequest.Builder();
         // Other packages such as wallpaper can be changed outside of themes
         // and are not tracked well by the provider. We only care to apply resources that may crash
         // the system if they are not reapplied.
         ThemeConfig themeConfig = config.themeConfig;
         if (pkgName.equals(themeConfig.getFontPkgName())) {
-            reApply.add(ThemesColumns.MODIFIES_FONTS);
+            builder.setFont(pkgName);
         }
         if (pkgName.equals(themeConfig.getIconPackPkgName())) {
-            reApply.add(ThemesColumns.MODIFIES_ICONS);
+            builder.setIcons(pkgName);
         }
         if (pkgName.equals(themeConfig.getOverlayPkgName())) {
-            reApply.add(ThemesColumns.MODIFIES_OVERLAYS);
+            builder.setOverlay(pkgName);
+        }
+        if (pkgName.equals(themeConfig.getOverlayPkgNameForApp(SYSTEMUI_STATUS_BAR_PKG))) {
+            builder.setStatusBar(pkgName);
+        }
+        if (pkgName.equals(themeConfig.getOverlayPkgNameForApp(SYSTEMUI_NAVBAR_PKG))) {
+            builder.setNavBar(pkgName);
         }
 
+        // Check if there are any per-app overlays using this theme
+        final Map<String, ThemeConfig.AppTheme> themes = themeConfig.getAppThemes();
+        for (String appPkgName : themes.keySet()) {
+            if (ThemeUtils.isPerAppThemeComponent(appPkgName)) {
+                builder.setAppOverlay(appPkgName, pkgName);
+            }
+        }
+
+        builder.setRequestType(RequestType.THEME_UPDATED);
         ThemeManager manager = (ThemeManager) context.getSystemService(Context.THEME_SERVICE);
-        manager.requestThemeChange(pkgName, reApply);
+        manager.requestThemeChange(builder.build(), false);
     }
 }
